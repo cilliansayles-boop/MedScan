@@ -80,7 +80,7 @@ elif TFLITE_MODEL_PATH.exists():
 else:
     raise FileNotFoundError("No model found (hybrid_crnn_v4.keras or hybrid_crnn_v4_f32.tflite)")
 
-for path in [META_PATH, SCALER_PATH]:
+for path in [META_PATH, SCALER_JSON_PATH]:
     if not path.exists():
         raise FileNotFoundError(f"Required file not found: {path}")
 
@@ -90,7 +90,7 @@ with open(META_PATH) as f:
     MODEL_META = json.load(f)
     logger.info(f"Model: {MODEL_META['model_name']}")
 
-with open(SCALER_PATH) as f:
+with open(SCALER_JSON_PATH) as f:
     SCALER_DATA  = json.load(f)
     SCALER_MEAN  = np.array(SCALER_DATA['mean_'],  dtype=np.float32)
     SCALER_SCALE = np.array(SCALER_DATA['scale_'], dtype=np.float32)
