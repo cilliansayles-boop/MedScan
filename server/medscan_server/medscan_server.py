@@ -62,13 +62,12 @@ limiter = Limiter(key_func=get_remote_address)
 # ============================================================
 import os
 from pathlib import Path
-
 # Get the directory where this file is located
 current_dir = Path(__file__).parent.parent  # Goes up to server/
 KERAS_MODEL_PATH  = current_dir / "hybrid_crnn_v4_f32" / "hybrid_crnn_v4.keras"
 TFLITE_MODEL_PATH = current_dir / "hybrid_crnn_v4_f32" / "hybrid_crnn_v4_f32.tflite"
-META_PATH         = Path("model_meta.json")
-SCALER_PATH       = Path("feat_scaler.json")
+META_PATH         = current_dir / "model_meta" / "model_meta.json"
+SCALER_JSON_PATH  = current_dir / "feat_scaler" / "feat_scaler.json"
 
 if KERAS_MODEL_PATH.exists():
     USE_KERAS  = True
