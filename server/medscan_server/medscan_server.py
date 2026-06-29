@@ -60,8 +60,8 @@ limiter = Limiter(key_func=get_remote_address)
 # ============================================================
 # CONFIG & PATHS
 # ============================================================
-KERAS_MODEL_PATH  = Path("hybrid_crnn_v4.keras")
-TFLITE_MODEL_PATH = Path("hybrid_crnn_v4_f32.tflite")
+KERAS_MODEL_PATH  = Path("../hybrid_crnn_v4_f32/hybrid_crnn_v4.keras")
+TFLITE_MODEL_PATH = Path("../hybrid_crnn_v4_f32/hybrid_crnn_v4_f32.tflite")
 META_PATH         = Path("model_meta.json")
 SCALER_PATH       = Path("feat_scaler.json")
 
