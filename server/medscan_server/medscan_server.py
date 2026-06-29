@@ -1,15 +1,18 @@
 """
-MedScann Server v2.3 — Production-Grade with GDPR + Frontend Serving
-FIXES:
-  v2.2: Spectrogram shape enforced to (64, 87, 1)
-  v2.3: Feature extraction now L2-normalized to match training notebook
-  v2.3+: Serves React frontend from ../frontend/build
+MedScann Server v2.4 — Production
+FIXES v2.4:
+  - Static mount moved AFTER all routes (was intercepting /api/predict)
+  - CORS allow_credentials fixed (was invalid with allow_origins=*)
+  - RateLimitExceeded handler now returns JSONResponse correctly
+  - TrustedHostMiddleware removed (was blocking Render requests)
+  - Sir Bobbly Sock display names
 """
 
 import json
 import logging
 import logging.handlers
 import io
+import os
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -20,8 +23,8 @@ import secrets
 import librosa
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -53,7 +56,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # SECURITY CONFIG
 # ============================================================
-API_KEY       = "medscan-secure-key-2024"
+API_KEY        = "medscan-secure-key-2024"
 MAX_AUDIO_SIZE = 10 * 1024 * 1024
 
 limiter = Limiter(key_func=get_remote_address)
@@ -61,9 +64,6 @@ limiter = Limiter(key_func=get_remote_address)
 # ============================================================
 # CONFIG & PATHS
 # ============================================================
-import os
-from pathlib import Path
-# Get the directory where this file is located
 current_dir = Path(__file__).parent.parent  # Goes up to server/
 KERAS_MODEL_PATH  = current_dir / "hybrid_crnn_v4_f32" / "hybrid_crnn_v4.keras"
 TFLITE_MODEL_PATH = current_dir / "hybrid_crnn_v4_f32" / "hybrid_crnn_v4_f32.tflite"
@@ -73,13 +73,13 @@ SCALER_JSON_PATH  = current_dir / "feat_scaler" / "feat_scaler.json"
 if KERAS_MODEL_PATH.exists():
     USE_KERAS  = True
     MODEL_PATH = KERAS_MODEL_PATH
-    logger.info(f"Using Keras model: {MODEL_PATH}")
+    logger.info(f"Sir Bobbly Sock (Keras) found: {MODEL_PATH}")
 elif TFLITE_MODEL_PATH.exists():
     USE_KERAS  = False
     MODEL_PATH = TFLITE_MODEL_PATH
-    logger.info(f"Using TFLite model: {MODEL_PATH}")
+    logger.info(f"Sir Bobbly Sock (TFLite) found: {MODEL_PATH}")
 else:
-    raise FileNotFoundError("No model found (hybrid_crnn_v4.keras or hybrid_crnn_v4_f32.tflite)")
+    raise FileNotFoundError("Sir Bobbly Sock not found — check model files exist in hybrid_crnn_v4_f32/")
 
 for path in [META_PATH, SCALER_JSON_PATH]:
     if not path.exists():
@@ -89,7 +89,7 @@ logger.info("All required files found")
 
 with open(META_PATH) as f:
     MODEL_META = json.load(f)
-    logger.info(f"Model: {MODEL_META['model_name']}")
+    logger.info(f"Sir Bobbly Sock ready: {MODEL_META['model_name']}")
 
 with open(SCALER_JSON_PATH) as f:
     SCALER_DATA  = json.load(f)
@@ -99,16 +99,16 @@ with open(SCALER_JSON_PATH) as f:
 if not TF_AVAILABLE:
     raise ImportError("TensorFlow required")
 
-MODEL        = None
-interpreter  = None
+MODEL          = None
+interpreter    = None
 input_details  = None
 output_details = None
 
-# ── Custom layers ────────────────────────────────────────────────────
+# ── Custom layers ────────────────────────────────────────────
 class TemporalAttention(tf.keras.layers.Layer):
     def __init__(self, units=32, **kwargs):
         super().__init__(**kwargs)
-        self.units      = units
+        self.units       = units
         self.score_dense = tf.keras.layers.Dense(units, activation="tanh")
         self.score_out   = tf.keras.layers.Dense(1, use_bias=False)
     def call(self, x, training=False):
@@ -143,9 +143,9 @@ CUSTOM_OBJECTS = {"TemporalAttention": TemporalAttention, "FocalLoss": FocalLoss
 if USE_KERAS:
     try:
         MODEL = tf.keras.models.load_model(str(KERAS_MODEL_PATH), custom_objects=CUSTOM_OBJECTS)
-        logger.info(f"Keras model loaded ({MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
+        logger.info(f"Sir Bobbly Sock (Keras) loaded ({MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
     except Exception as e:
-        logger.error(f"Keras model loading error: {e}")
+        logger.error(f"Sir Bobbly Sock load error: {e}")
         raise
 else:
     try:
@@ -153,25 +153,25 @@ else:
         interpreter.allocate_tensors()
         input_details  = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
-        logger.info(f"TFLite model loaded ({MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
+        logger.info(f"Sir Bobbly Sock (TFLite) loaded ({MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
     except Exception as e:
-        logger.error(f"TFLite load error, falling back to Keras: {e}")
-        MODEL    = tf.keras.models.load_model(str(KERAS_MODEL_PATH), custom_objects=CUSTOM_OBJECTS)
+        logger.error(f"Sir Bobbly Sock TFLite error, trying Keras: {e}")
+        MODEL     = tf.keras.models.load_model(str(KERAS_MODEL_PATH), custom_objects=CUSTOM_OBJECTS)
         USE_KERAS = True
-        logger.info(f"Keras fallback loaded ({KERAS_MODEL_PATH.stat().st_size / 1e6:.1f} MB)")
+        logger.info(f"Sir Bobbly Sock Keras fallback loaded")
 
 # ============================================================
 # RESPONSE MODELS
 # ============================================================
 class PredictionResult(BaseModel):
-    condition:    str
-    severity:     str
-    confidence:   float
-    explanation:  str
-    actions:      list
-    seeDoctor:    bool
+    condition:     str
+    severity:      str
+    confidence:    float
+    explanation:   str
+    actions:       list
+    seeDoctor:     bool
     probabilities: dict = {}
-    timestamp:    str  = ""
+    timestamp:     str  = ""
 
 class HealthCheckResponse(BaseModel):
     status:    str
@@ -213,13 +213,10 @@ def generate_request_id() -> str:
     return secrets.token_hex(8)
 
 # ============================================================
-# FEATURE EXTRACTION  —  must match training notebook exactly
+# FEATURE EXTRACTION — must match training notebook exactly
 # ============================================================
 def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]:
-    """
-    Mel spectrogram → enforced shape (64, 87, 1).
-    Matches extract_dual() in training notebook.
-    """
+    """Mel spectrogram → enforced shape (64, 87, 1)."""
     try:
         if audio_data.ndim > 1:
             audio_data = np.mean(audio_data, axis=1)
@@ -242,7 +239,7 @@ def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]
 
         audio_data = np.nan_to_num(audio_data)
 
-        mel    = librosa.feature.melspectrogram(
+        mel     = librosa.feature.melspectrogram(
             y=audio_data, sr=sr,
             n_mels=MODEL_META['n_mels'], n_fft=MODEL_META['n_fft'],
             hop_length=MODEL_META['hop_length'],
@@ -255,7 +252,6 @@ def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]
             return None
         spec = (log_mel - lo) / (hi - lo)
 
-        # ── Enforce exact shape (64, 87) ──────────────────────────────
         target_mels   = MODEL_META['spec_shape'][0]   # 64
         target_frames = MODEL_META['spec_shape'][1]   # 87
 
@@ -281,14 +277,9 @@ def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]
 def extract_acoustic_features(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]:
     """
     151-dim acoustic feature vector.
-
-    MUST match training notebook extract_dual() exactly:
-      mfcc_mean (40) + mfcc_std (40) + logmel_mean (64) +
-      [rms, zcr, sc_mean, sc_std, sr_mean, sr_std, rms_std]  (7)
-      = 151 total
-
-    Then L2-normalised (norm → unit vector) — CRITICAL to match training.
-    Then StandardScaler applied using feat_scaler.json.
+    mfcc_mean(40) + mfcc_std(40) + logmel_mean(64) +
+    [rms, zcr, sc_mean, sc_std, sr_mean, sr_std, rms_std] (7) = 151
+    Then L2-normalised, then StandardScaler.
     """
     try:
         if audio_data.ndim > 1:
@@ -312,50 +303,45 @@ def extract_acoustic_features(audio_data: np.ndarray, sr: int) -> Optional[np.nd
 
         audio_data = np.nan_to_num(audio_data)
 
-        # ── Feature extraction (same order as training) ───────────────
-        mel        = librosa.feature.melspectrogram(
+        mel         = librosa.feature.melspectrogram(
             y=audio_data, sr=sr,
             n_mels=MODEL_META['n_mels'], n_fft=MODEL_META['n_fft'],
             hop_length=MODEL_META['hop_length'],
             fmin=MODEL_META['fmin'], fmax=MODEL_META['fmax']
         )
-        mfcc       = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=MODEL_META['n_mfcc'])
-        mfcc_mean  = np.mean(mfcc, axis=1)          # (40,)
-        mfcc_std   = np.std(mfcc,  axis=1)           # (40,)
-        logmel_mean = np.mean(librosa.power_to_db(mel), axis=1)  # (64,)
+        mfcc        = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=MODEL_META['n_mfcc'])
+        mfcc_mean   = np.mean(mfcc, axis=1)
+        mfcc_std    = np.std(mfcc,  axis=1)
+        logmel_mean = np.mean(librosa.power_to_db(mel), axis=1)
 
-        rms_frames = librosa.feature.rms(y=audio_data).squeeze()
-        rms        = float(np.mean(rms_frames))
-        rms_std    = float(np.std(rms_frames))
-        zcr        = float(np.mean(librosa.feature.zero_crossing_rate(audio_data)))
-
-        sc         = librosa.feature.spectral_centroid(y=audio_data, sr=sr).squeeze()
+        rms_frames      = librosa.feature.rms(y=audio_data).squeeze()
+        rms             = float(np.mean(rms_frames))
+        rms_std         = float(np.std(rms_frames))
+        zcr             = float(np.mean(librosa.feature.zero_crossing_rate(audio_data)))
+        sc              = librosa.feature.spectral_centroid(y=audio_data, sr=sr).squeeze()
         sc_mean, sc_std = float(np.mean(sc)), float(np.std(sc))
-
-        sr_f       = librosa.feature.spectral_rolloff(y=audio_data, sr=sr).squeeze()
+        sr_f            = librosa.feature.spectral_rolloff(y=audio_data, sr=sr).squeeze()
         sr_mean, sr_std = float(np.mean(sr_f)), float(np.std(sr_f))
 
         features = np.concatenate([
             mfcc_mean, mfcc_std, logmel_mean,
             [rms, zcr, sc_mean, sc_std, sr_mean, sr_std, rms_std]
-        ])   # 40+40+64+7 = 151
+        ])
 
         features = np.nan_to_num(features)
 
-        # ── L2 normalise — MUST match training ────────────────────────
         norm = np.linalg.norm(features)
         if norm < 1e-8:
             logger.error("Feature vector near-zero — unusable audio")
             return None
         features = (features / norm).astype(np.float32)
 
-        # Pad / trim safety net
         if len(features) > 151:
             features = features[:151]
         elif len(features) < 151:
             features = np.pad(features, (0, 151 - len(features)))
 
-        logger.info(f"Features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}, mean={features.mean():.4f}")
+        logger.info(f"Features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}")
         return features
 
     except Exception as e:
@@ -381,10 +367,6 @@ def build_symptom_vector(answers: dict) -> np.ndarray:
 def run_inference(spec_input, feat_input, symp_input) -> dict:
     try:
         if USE_KERAS:
-            logger.info(f"DEBUG — spec: {spec_input.shape} min={spec_input.min():.3f} max={spec_input.max():.3f}")
-            logger.info(f"DEBUG — feat: {feat_input.shape} min={feat_input.min():.4f} max={feat_input.max():.4f} mean={feat_input.mean():.4f}")
-            logger.info(f"DEBUG — symp: {symp_input.shape} values={symp_input[0]}")
-
             output = MODEL.predict({
                 "spec_input": spec_input,
                 "feat_input": feat_input,
@@ -400,18 +382,16 @@ def run_inference(spec_input, feat_input, symp_input) -> dict:
 
         exp_logits    = np.exp(logits - np.max(logits))
         probabilities = exp_logits / np.sum(exp_logits)
-
-        class_idx = np.argmax(probabilities)
-        condition = MODEL_META['class_names'][class_idx]
-        confidence = float(probabilities[class_idx])
-
-        probs_dict = {name: float(probabilities[i])
-                      for i, name in enumerate(MODEL_META['class_names'])}
+        class_idx     = np.argmax(probabilities)
+        condition     = MODEL_META['class_names'][class_idx]
+        confidence    = float(probabilities[class_idx])
+        probs_dict    = {name: float(probabilities[i])
+                         for i, name in enumerate(MODEL_META['class_names'])}
 
         return {'condition': condition, 'confidence': confidence, 'probabilities': probs_dict}
 
     except Exception as e:
-        logger.error(f"Inference failed: {e}")
+        logger.error(f"Sir Bobbly Sock inference failed: {e}")
         raise ValueError(f"Inference error: {str(e)}")
 
 
@@ -448,54 +428,58 @@ def generate_explanation(condition: str, confidence: float) -> dict:
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Server starting")
+    logger.info("Sir Bobbly Sock server starting")
     yield
-    logger.info("Server shutting down")
+    logger.info("Sir Bobbly Sock server shutting down")
 
 app = FastAPI(
     title="MedScann API",
-    description="Respiratory disease classification",
-    version="2.3.0",
+    description="Respiratory disease classification — powered by Sir Bobbly Sock",
+    version="2.4.0",
     lifespan=lifespan
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded,
-    lambda r, e: HTTPException(status_code=429, detail="Rate limit exceeded"))
 
-app.add_middleware(TrustedHostMiddleware,
-    allowed_hosts=["localhost", "127.0.0.1", "*.replit.dev", "*.onrender.com"])
+# FIX: return JSONResponse not HTTPException from handler
+app.add_exception_handler(
+    RateLimitExceeded,
+    lambda request, exc: JSONResponse(
+        status_code=429,
+        content={"detail": "Rate limit exceeded. Please wait and try again."}
+    )
+)
+
+# FIX: allow_credentials=False when allow_origins=* (browsers reject True + *)
 app.add_middleware(CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ============================================================
-# SERVE REACT FRONTEND
-# ============================================================
-frontend_path = current_dir.parent / "frontended" / "build"
-if frontend_path.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")
-    logger.info(f"Frontend mounted from {frontend_path}")
-else:
-    logger.warning(f"Frontend path not found: {frontend_path}")
-
-# ============================================================
-# ROUTES
+# API ROUTES — registered BEFORE static mount
 # ============================================================
 @app.get("/api/health", response_model=HealthCheckResponse)
 async def health_check():
-    return HealthCheckResponse(status="healthy", model=MODEL_META['model_name'],
-                               version="2.3.0", timestamp=datetime.now().isoformat())
+    return HealthCheckResponse(
+        status="healthy",
+        model="Sir Bobbly Sock",
+        version="2.4.0",
+        timestamp=datetime.now().isoformat()
+    )
 
 @app.get("/api/privacy", response_model=GDPRResponse)
 async def privacy_policy():
     return GDPRResponse(
         message="GDPR Compliance Information",
         privacy_notice="Raw data deleted immediately. Predictions kept 7 days. Anonymized metrics kept forever.",
-        user_rights=["Right to access your data", "Right to deletion",
-                     "Right to withdraw consent", "Right to data portability"]
+        user_rights=[
+            "Right to access your data",
+            "Right to deletion",
+            "Right to withdraw consent",
+            "Right to data portability"
+        ]
     )
 
 @app.post("/api/predict", response_model=PredictionResult)
@@ -522,7 +506,7 @@ async def predict(
         if len(audio_bytes) > MAX_AUDIO_SIZE:
             raise HTTPException(status_code=413, detail="File too large")
         if len(audio_bytes) < 1000:
-            raise HTTPException(status_code=400, detail="Audio file too small")
+            raise HTTPException(status_code=400, detail="Audio file too small — please record a cough")
 
         try:
             audio_data, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
@@ -537,28 +521,27 @@ async def predict(
 
         spec = extract_spectrogram(audio_data, sr)
         if spec is None:
-            raise HTTPException(status_code=400, detail="Failed to extract spectrogram")
+            raise HTTPException(status_code=400, detail="Failed to extract spectrogram — check audio quality")
 
         feat = extract_acoustic_features(audio_data, sr)
         if feat is None:
-            raise HTTPException(status_code=400, detail="Failed to extract features")
+            raise HTTPException(status_code=400, detail="Failed to extract features — check audio quality")
 
         symp = build_symptom_vector(answers_dict)
 
         # Apply StandardScaler (on already L2-normalised features)
         feat = (feat - SCALER_MEAN) / (SCALER_SCALE + 1e-8)
 
-        # Add batch dimension
         spec = np.expand_dims(spec, axis=0)   # (1, 64, 87, 1)
         feat = np.expand_dims(feat, axis=0)   # (1, 151)
         symp = np.expand_dims(symp, axis=0)   # (1, 14)
 
-        result    = run_inference(spec, feat, symp)
-        condition = result['condition']
-        confidence = result['confidence']
+        result        = run_inference(spec, feat, symp)
+        condition     = result['condition']
+        confidence    = result['confidence']
         severity_info = generate_explanation(condition, confidence)
 
-        logger.info(f"[{request_id}] PREDICTION: {condition} ({confidence:.1%}) | Probs: {result['probabilities']}")
+        logger.info(f"[{request_id}] PREDICTION: {condition} ({confidence:.1%}) | {result['probabilities']}")
 
         return PredictionResult(
             condition=condition,
@@ -578,8 +561,17 @@ async def predict(
         logger.error(f"[{request_id}] Unexpected error: {e}")
         raise HTTPException(status_code=500, detail="Server error")
 
+# ============================================================
+# STATIC FILES — MUST be AFTER all API routes
+# ============================================================
+frontend_path = current_dir.parent / "frontended" / "build"
+if frontend_path.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")
+    logger.info(f"Frontend mounted from {frontend_path}")
+else:
+    logger.warning(f"Frontend build not found at: {frontend_path}")
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting server on http://localhost:8000")
+    logger.info("Starting Sir Bobbly Sock on http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
