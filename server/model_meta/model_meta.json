@@ -1,0 +1,77 @@
+{
+  "model_name": "HybridCRNN v4",
+  "model_sha256": "688e650a9429",
+  "sample_rate": 22050,
+  "clip_dur": 2.0,
+  "n_mels": 64,
+  "n_fft": 2048,
+  "hop_length": 512,
+  "fmin": 50.0,
+  "fmax": 8000.0,
+  "n_mfcc": 40,
+  "feature_dim": 151,
+  "spec_shape": [
+    64,
+    87,
+    1
+  ],
+  "symptom_dim": 14,
+  "symptom_fields": [
+    "fever",
+    "loss_of_smell",
+    "fatigue",
+    "sore_throat",
+    "cold",
+    "chronic_resp",
+    "smoker",
+    "wet_cough",
+    "age_young",
+    "age_old",
+    "diarrhoea",
+    "diabetes",
+    "hypertension",
+    "muscle_pain"
+  ],
+  "class_names": [
+    "Healthy",
+    "COVID-19",
+    "URTI / Cold"
+  ],
+  "risk_map": {
+    "0": "LOW",
+    "1": "HIGH",
+    "2": "LOW-MEDIUM"
+  },
+  "test_accuracy": 0.7542,
+  "test_macro_f1": 0.6525,
+  "test_macro_auc": 0.7946,
+  "input_names": [
+    "spec_input",
+    "feat_input",
+    "symp_input"
+  ],
+  "input_shapes": [
+    [
+      64,
+      87,
+      1
+    ],
+    [
+      151
+    ],
+    [
+      14
+    ]
+  ],
+  "scaler_file": "feat_scaler.json",
+  "datasets": [
+    "CoughVID",
+    "Coswara"
+  ],
+  "multi_cough": {
+    "enabled": true,
+    "target_coughs": 3,
+    "silence_threshold_db": 25,
+    "description": "Upload one recording with 3 coughs. Model runs on each and averages."
+  }
+}
