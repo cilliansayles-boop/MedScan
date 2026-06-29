@@ -474,7 +474,7 @@ app.add_middleware(CORSMiddleware,
 # ============================================================
 # SERVE REACT FRONTEND
 # ============================================================
-frontend_path = current_dir / "frontend" / "build"
+frontend_path = current_dir / "frontended" / "build"
 if frontend_path.exists():
     app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")
     logger.info(f"Frontend mounted from {frontend_path}")
