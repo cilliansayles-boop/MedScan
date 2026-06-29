@@ -1,8 +1,9 @@
 """
-MedScann Server v2.3 — Production-Grade with GDPR
+MedScann Server v2.3 — Production-Grade with GDPR + Frontend Serving
 FIXES:
   v2.2: Spectrogram shape enforced to (64, 87, 1)
   v2.3: Feature extraction now L2-normalized to match training notebook
+  v2.3+: Serves React frontend from ../frontend/build
 """
 
 import json
@@ -16,11 +17,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import hashlib
 import secrets
-
 import librosa
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -462,28 +463,33 @@ app.add_exception_handler(RateLimitExceeded,
     lambda r, e: HTTPException(status_code=429, detail="Rate limit exceeded"))
 
 app.add_middleware(TrustedHostMiddleware,
-    allowed_hosts=["localhost", "127.0.0.1", "*.replit.dev"])
+    allowed_hosts=["localhost", "127.0.0.1", "*.replit.dev", "*.onrender.com"])
 app.add_middleware(CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ============================================================
+# SERVE REACT FRONTEND
+# ============================================================
+frontend_path = current_dir / "frontend" / "build"
+if frontend_path.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")
+    logger.info(f"Frontend mounted from {frontend_path}")
+else:
+    logger.warning(f"Frontend path not found: {frontend_path}")
+
+# ============================================================
 # ROUTES
 # ============================================================
-@app.get("/")
-async def root():
-    return {"service": "MedScann API", "model": MODEL_META['model_name'],
-            "version": "2.3.0", "status": "running"}
-
-@app.get("/health", response_model=HealthCheckResponse)
+@app.get("/api/health", response_model=HealthCheckResponse)
 async def health_check():
     return HealthCheckResponse(status="healthy", model=MODEL_META['model_name'],
                                version="2.3.0", timestamp=datetime.now().isoformat())
 
-@app.get("/privacy", response_model=GDPRResponse)
+@app.get("/api/privacy", response_model=GDPRResponse)
 async def privacy_policy():
     return GDPRResponse(
         message="GDPR Compliance Information",
@@ -492,7 +498,7 @@ async def privacy_policy():
                      "Right to withdraw consent", "Right to data portability"]
     )
 
-@app.post("/predict", response_model=PredictionResult)
+@app.post("/api/predict", response_model=PredictionResult)
 @limiter.limit("20/minute")
 async def predict(
     request: Request,
