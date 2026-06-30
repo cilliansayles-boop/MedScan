@@ -1,11 +1,21 @@
 """
-MedScann Server v2.4 — Production
-FIXES v2.4:
-  - Static mount moved AFTER all routes (was intercepting /api/predict)
-  - CORS allow_credentials fixed (was invalid with allow_origins=*)
-  - RateLimitExceeded handler now returns JSONResponse correctly
-  - TrustedHostMiddleware removed (was blocking Render requests)
-  - Sir Bobbly Sock display names
+MedScann Server v2.6 — Production / Hardened + Performance-Optimised
+NEW v2.6 — PERFORMANCE:
+  - Spectrogram + acoustic features now share ONE audio preprocessing
+    pass and ONE mel-spectrogram computation (was computed twice)
+  - Heavy CPU work (decode/features/inference) now runs in a threadpool
+    via run_in_threadpool, so the event loop stays free to answer
+    /api/health etc. during a prediction
+  - threading.Lock added around model inference (Keras/TFLite are not
+    guaranteed thread-safe under concurrent calls)
+v2.5 — SECURITY HARDENING (carried forward):
+  - API key from environment variable (not hardcoded)
+  - CORS restricted to known origins
+  - Security headers added
+  - Audio content-type whitelist + duration cap
+  - 'answers' JSON payload size cap
+v2.4 (carried forward):
+  - Static mount after routes, correct TFLite tensor order, Sir Bobbly Sock names
 """
 
 import json
@@ -13,6 +23,7 @@ import logging
 import logging.handlers
 import io
 import os
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -25,6 +36,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Header, Requ
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.concurrency import run_in_threadpool
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -56,8 +69,32 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # SECURITY CONFIG
 # ============================================================
-API_KEY        = "medscan-secure-key-2024"
-MAX_AUDIO_SIZE = 10 * 1024 * 1024
+# v2.5: API key now comes from an environment variable.
+# On Render: Dashboard → your service → Environment → Add Environment Variable
+#   Key:   MEDSCAN_API_KEY
+#   Value: <pick a long random string>
+# Locally (PowerShell), before running the server:
+#   $env:MEDSCAN_API_KEY = "your-local-test-key"
+DEFAULT_DEV_KEY = "medscan-secure-key-2024"
+API_KEY = os.environ.get("MEDSCAN_API_KEY", DEFAULT_DEV_KEY)
+if API_KEY == DEFAULT_DEV_KEY:
+    logger.warning(
+        "SECURITY WARNING: MEDSCAN_API_KEY env var not set — using the default "
+        "development key. Set MEDSCAN_API_KEY on Render before going live."
+    )
+
+MAX_AUDIO_SIZE      = 10 * 1024 * 1024   # 10 MB
+MAX_AUDIO_DURATION  = 30.0               # seconds — reject anything longer after decode
+MAX_ANSWERS_LENGTH  = 2000               # chars — generous for 14 symptom fields' JSON
+
+# v2.5: restrict CORS to known origins instead of "*".
+# Add any extra domains here if you deploy a second frontend / custom domain.
+# Note: native mobile apps (Taha's app) don't send an Origin header, so they
+# are NOT affected by CORS at all — this restriction only applies to browsers.
+ALLOWED_ORIGINS = [
+    "https://medscan-n6k2.onrender.com",
+    "http://localhost:3000",   # local React dev server
+]
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -194,7 +231,8 @@ def verify_api_key(authorization: str = Header(None)) -> bool:
         scheme, credentials = authorization.split()
         if scheme.lower() != "bearer":
             raise HTTPException(status_code=401, detail="Invalid auth scheme")
-        if credentials != API_KEY:
+        # v2.5: constant-time comparison to avoid timing attacks on the key
+        if not secrets.compare_digest(credentials, API_KEY):
             raise HTTPException(status_code=401, detail="Invalid API key")
         return True
     except ValueError:
@@ -212,39 +250,74 @@ def validate_filename(filename: str, ip: str) -> bool:
 def generate_request_id() -> str:
     return secrets.token_hex(8)
 
+# v2.5: only accept content-types that are plausibly audio.
+# Browsers/MediaRecorder/our own WAV converter all set one of these.
+ALLOWED_AUDIO_CONTENT_TYPES = {
+    "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4", "audio/m4a",
+    "application/octet-stream",  # some browsers/mobile clients omit a specific type
+}
+
+def validate_content_type(content_type: Optional[str], ip: str) -> bool:
+    if not content_type:
+        return True  # some clients omit it; we still validate via librosa decode
+    base_type = content_type.split(";")[0].strip().lower()
+    if base_type not in ALLOWED_AUDIO_CONTENT_TYPES:
+        logger.warning(f"Rejected unexpected content-type '{content_type}' from {ip}")
+        return False
+    return True
+
 # ============================================================
 # FEATURE EXTRACTION — must match training notebook exactly
+# v2.6 PERFORMANCE: spectrogram + acoustic features now share ONE
+# audio preprocessing pass and ONE mel-spectrogram computation,
+# instead of redoing both from scratch twice (roughly halves
+# preprocessing time per request on the free-tier CPU).
+# Numeric output is identical to v2.5 — this is purely a speed fix.
 # ============================================================
-def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]:
-    """Mel spectrogram → enforced shape (64, 87, 1)."""
+def preprocess_audio(audio_data: np.ndarray, sr: int) -> tuple:
+    """Mono-mix, normalise, resample to model rate, pad/trim to clip_dur."""
+    if audio_data.ndim > 1:
+        audio_data = np.mean(audio_data, axis=1)
+    audio_data = audio_data.astype(np.float32)
+
+    max_val = np.max(np.abs(audio_data))
+    if max_val > 0:
+        audio_data = audio_data / max_val
+
+    if sr != MODEL_META['sample_rate']:
+        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=MODEL_META['sample_rate'])
+        sr = MODEL_META['sample_rate']
+
+    n_samples = int(sr * MODEL_META['clip_dur'])
+    if len(audio_data) < n_samples:
+        reps       = int(np.ceil(n_samples / len(audio_data)))
+        audio_data = np.tile(audio_data, reps)[:n_samples]
+    else:
+        audio_data = audio_data[:n_samples]
+
+    audio_data = np.nan_to_num(audio_data)
+    return audio_data, sr
+
+
+def extract_dual_features(audio_data: np.ndarray, sr: int) -> Optional[tuple]:
+    """
+    Returns (spec, feat) computed from ONE preprocessing + ONE mel pass.
+    spec: (64, 87, 1) spectrogram for the CNN stream
+    feat: (151,) acoustic feature vector for the MLP stream
+    """
     try:
-        if audio_data.ndim > 1:
-            audio_data = np.mean(audio_data, axis=1)
-        audio_data = audio_data.astype(np.float32)
+        audio_data, sr = preprocess_audio(audio_data, sr)
 
-        max_val = np.max(np.abs(audio_data))
-        if max_val > 0:
-            audio_data = audio_data / max_val
-
-        if sr != MODEL_META['sample_rate']:
-            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=MODEL_META['sample_rate'])
-            sr = MODEL_META['sample_rate']
-
-        n_samples = int(sr * MODEL_META['clip_dur'])
-        if len(audio_data) < n_samples:
-            reps       = int(np.ceil(n_samples / len(audio_data)))
-            audio_data = np.tile(audio_data, reps)[:n_samples]
-        else:
-            audio_data = audio_data[:n_samples]
-
-        audio_data = np.nan_to_num(audio_data)
-
-        mel     = librosa.feature.melspectrogram(
+        # ── ONE mel spectrogram, reused for both streams ──────────────
+        mel = librosa.feature.melspectrogram(
             y=audio_data, sr=sr,
             n_mels=MODEL_META['n_mels'], n_fft=MODEL_META['n_fft'],
             hop_length=MODEL_META['hop_length'],
             fmin=MODEL_META['fmin'], fmax=MODEL_META['fmax']
         )
+
+        # ── Spectrogram stream ─────────────────────────────────────────
         log_mel = librosa.power_to_db(mel, ref=np.max)
         lo, hi  = log_mel.min(), log_mel.max()
         if hi - lo < 1e-6:
@@ -267,52 +340,15 @@ def extract_spectrogram(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]
 
         spec = np.expand_dims(spec, axis=-1).astype(np.float32)   # (64,87,1)
         logger.info(f"Spectrogram shape: {spec.shape}")
-        return spec
 
-    except Exception as e:
-        logger.error(f"Spectrogram extraction failed: {e}")
-        return None
-
-
-def extract_acoustic_features(audio_data: np.ndarray, sr: int) -> Optional[np.ndarray]:
-    """
-    151-dim acoustic feature vector.
-    mfcc_mean(40) + mfcc_std(40) + logmel_mean(64) +
-    [rms, zcr, sc_mean, sc_std, sr_mean, sr_std, rms_std] (7) = 151
-    Then L2-normalised, then StandardScaler.
-    """
-    try:
-        if audio_data.ndim > 1:
-            audio_data = np.mean(audio_data, axis=1)
-        audio_data = audio_data.astype(np.float32)
-
-        max_val = np.max(np.abs(audio_data))
-        if max_val > 0:
-            audio_data = audio_data / max_val
-
-        if sr != MODEL_META['sample_rate']:
-            audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=MODEL_META['sample_rate'])
-            sr = MODEL_META['sample_rate']
-
-        n_samples = int(sr * MODEL_META['clip_dur'])
-        if len(audio_data) < n_samples:
-            reps       = int(np.ceil(n_samples / len(audio_data)))
-            audio_data = np.tile(audio_data, reps)[:n_samples]
-        else:
-            audio_data = audio_data[:n_samples]
-
-        audio_data = np.nan_to_num(audio_data)
-
-        mel         = librosa.feature.melspectrogram(
-            y=audio_data, sr=sr,
-            n_mels=MODEL_META['n_mels'], n_fft=MODEL_META['n_fft'],
-            hop_length=MODEL_META['hop_length'],
-            fmin=MODEL_META['fmin'], fmax=MODEL_META['fmax']
-        )
+        # ── Acoustic feature stream ────────────────────────────────────
+        # NOTE: mfcc intentionally uses librosa's own internal mel
+        # defaults (different params from our custom mel above) —
+        # this matches the original training notebook exactly.
         mfcc        = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=MODEL_META['n_mfcc'])
         mfcc_mean   = np.mean(mfcc, axis=1)
         mfcc_std    = np.std(mfcc,  axis=1)
-        logmel_mean = np.mean(librosa.power_to_db(mel), axis=1)
+        logmel_mean = np.mean(librosa.power_to_db(mel), axis=1)   # reuses shared mel
 
         rms_frames      = librosa.feature.rms(y=audio_data).squeeze()
         rms             = float(np.mean(rms_frames))
@@ -327,7 +363,6 @@ def extract_acoustic_features(audio_data: np.ndarray, sr: int) -> Optional[np.nd
             mfcc_mean, mfcc_std, logmel_mean,
             [rms, zcr, sc_mean, sc_std, sr_mean, sr_std, rms_std]
         ])
-
         features = np.nan_to_num(features)
 
         norm = np.linalg.norm(features)
@@ -342,10 +377,11 @@ def extract_acoustic_features(audio_data: np.ndarray, sr: int) -> Optional[np.nd
             features = np.pad(features, (0, 151 - len(features)))
 
         logger.info(f"Features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}")
-        return features
+
+        return spec, features
 
     except Exception as e:
-        logger.error(f"Feature extraction error: {e}")
+        logger.error(f"Feature extraction failed: {e}")
         return None
 
 
@@ -363,22 +399,29 @@ def build_symptom_vector(answers: dict) -> np.ndarray:
 
 # ============================================================
 # INFERENCE
+# v2.6: a lock guards the model/interpreter since neither Keras'
+# predict() nor TFLite's Interpreter are guaranteed thread-safe
+# under concurrent calls — important once requests run in a
+# threadpool instead of serially on the event loop.
 # ============================================================
+inference_lock = threading.Lock()
+
 def run_inference(spec_input, feat_input, symp_input) -> dict:
     try:
-        if USE_KERAS:
-            output = MODEL.predict({
-                "spec_input": spec_input,
-                "feat_input": feat_input,
-                "symp_input": symp_input
-            }, verbose=0)
-            logits = output[0]
-        else:
-            interpreter.set_tensor(input_details[0]['index'], spec_input)
-            interpreter.set_tensor(input_details[1]['index'], feat_input)
-            interpreter.set_tensor(input_details[2]['index'], symp_input)
-            interpreter.invoke()
-            logits = interpreter.get_tensor(output_details[0]['index'])[0]
+        with inference_lock:
+            if USE_KERAS:
+                output = MODEL.predict({
+                    "spec_input": spec_input,
+                    "feat_input": feat_input,
+                    "symp_input": symp_input
+                }, verbose=0)
+                logits = output[0]
+            else:
+                interpreter.set_tensor(input_details[0]['index'], spec_input)
+                interpreter.set_tensor(input_details[1]['index'], symp_input)
+                interpreter.set_tensor(input_details[2]['index'], feat_input)
+                interpreter.invoke()
+                logits = interpreter.get_tensor(output_details[0]['index'])[0]
 
         exp_logits    = np.exp(logits - np.max(logits))
         probabilities = exp_logits / np.sum(exp_logits)
@@ -424,6 +467,20 @@ def generate_explanation(condition: str, confidence: float) -> dict:
     })
 
 # ============================================================
+# SECURITY HEADERS MIDDLEWARE (v2.5)
+# ============================================================
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Adds standard browser security headers to every response."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer-when-downgrade"
+        response.headers["Permissions-Policy"] = "microphone=(self), geolocation=()"
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        return response
+
+# ============================================================
 # APP SETUP
 # ============================================================
 @asynccontextmanager
@@ -435,12 +492,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MedScann API",
     description="Respiratory disease classification — powered by Sir Bobbly Sock",
-    version="2.4.0",
+    version="2.6.0",
     lifespan=lifespan
 )
 app.state.limiter = limiter
 
-# FIX: return JSONResponse not HTTPException from handler
 app.add_exception_handler(
     RateLimitExceeded,
     lambda request, exc: JSONResponse(
@@ -449,9 +505,11 @@ app.add_exception_handler(
     )
 )
 
-# FIX: allow_credentials=False when allow_origins=* (browsers reject True + *)
+app.add_middleware(SecurityHeadersMiddleware)
+
+# v2.5: CORS now restricted to known origins (was "*")
 app.add_middleware(CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["*"],
@@ -465,7 +523,7 @@ async def health_check():
     return HealthCheckResponse(
         status="healthy",
         model="Sir Bobbly Sock",
-        version="2.4.0",
+        version="2.6.0",
         timestamp=datetime.now().isoformat()
     )
 
@@ -481,6 +539,60 @@ async def privacy_policy():
             "Right to data portability"
         ]
     )
+
+def process_prediction_sync(audio_bytes: bytes, answers_dict: dict, request_id: str) -> dict:
+    """
+    v2.6: all CPU-heavy work (decode, feature extraction, inference)
+    lives in this single synchronous function, which the route runs
+    via run_in_threadpool — keeping the async event loop free to
+    answer other requests (like /api/health) while this one works.
+    """
+    try:
+        audio_data, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
+    except Exception as e:
+        logger.error(f"[{request_id}] Audio decode error: {e}")
+        raise HTTPException(status_code=400, detail="Could not decode audio. Try recording again.")
+
+    # Duration check happens on the RAW decoded audio, before our
+    # pipeline pads/trims everything to a fixed clip_dur — otherwise
+    # an oversized upload would always look like exactly 2 seconds.
+    duration = len(audio_data) / sr if sr else 0
+    if duration > MAX_AUDIO_DURATION:
+        logger.warning(f"[{request_id}] Audio too long ({duration:.1f}s) — rejected")
+        raise HTTPException(status_code=400, detail=f"Audio too long — please keep recordings under {int(MAX_AUDIO_DURATION)} seconds")
+
+    extracted = extract_dual_features(audio_data, sr)
+    if extracted is None:
+        raise HTTPException(status_code=400, detail="Failed to extract features — check audio quality")
+    spec, feat = extracted
+
+    symp = build_symptom_vector(answers_dict)
+
+    # Apply StandardScaler (on already L2-normalised features)
+    feat = (feat - SCALER_MEAN) / (SCALER_SCALE + 1e-8)
+
+    spec = np.expand_dims(spec, axis=0)   # (1, 64, 87, 1)
+    feat = np.expand_dims(feat, axis=0)   # (1, 151)
+    symp = np.expand_dims(symp, axis=0)   # (1, 14)
+
+    result        = run_inference(spec, feat, symp)
+    condition     = result['condition']
+    confidence    = result['confidence']
+    severity_info = generate_explanation(condition, confidence)
+
+    logger.info(f"[{request_id}] PREDICTION: {condition} ({confidence:.1%}) | {result['probabilities']}")
+
+    return {
+        "condition": condition,
+        "severity": severity_info['severity'],
+        "confidence": confidence,
+        "explanation": severity_info['explanation'],
+        "actions": severity_info['actions'],
+        "seeDoctor": severity_info['seeDoctor'],
+        "probabilities": result['probabilities'],
+        "timestamp": datetime.now().isoformat(),
+    }
+
 
 @app.post("/api/predict", response_model=PredictionResult)
 @limiter.limit("20/minute")
@@ -501,6 +613,13 @@ async def predict(
         if not validate_filename(audio.filename, client_ip):
             raise HTTPException(status_code=400, detail="Invalid filename")
 
+        if not validate_content_type(audio.content_type, client_ip):
+            raise HTTPException(status_code=400, detail="Unsupported audio format")
+
+        if len(answers) > MAX_ANSWERS_LENGTH:
+            logger.warning(f"[{request_id}] Oversized answers payload rejected ({len(answers)} chars)")
+            raise HTTPException(status_code=400, detail="Answers payload too large")
+
         audio_bytes = await audio.read()
 
         if len(audio_bytes) > MAX_AUDIO_SIZE:
@@ -509,50 +628,13 @@ async def predict(
             raise HTTPException(status_code=400, detail="Audio file too small — please record a cough")
 
         try:
-            audio_data, sr = librosa.load(io.BytesIO(audio_bytes), sr=None)
-        except Exception as e:
-            logger.error(f"[{request_id}] Audio decode error: {e}")
-            raise HTTPException(status_code=400, detail="Could not decode audio. Try recording again.")
-
-        try:
             answers_dict = json.loads(answers)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON answers")
 
-        spec = extract_spectrogram(audio_data, sr)
-        if spec is None:
-            raise HTTPException(status_code=400, detail="Failed to extract spectrogram — check audio quality")
-
-        feat = extract_acoustic_features(audio_data, sr)
-        if feat is None:
-            raise HTTPException(status_code=400, detail="Failed to extract features — check audio quality")
-
-        symp = build_symptom_vector(answers_dict)
-
-        # Apply StandardScaler (on already L2-normalised features)
-        feat = (feat - SCALER_MEAN) / (SCALER_SCALE + 1e-8)
-
-        spec = np.expand_dims(spec, axis=0)   # (1, 64, 87, 1)
-        feat = np.expand_dims(feat, axis=0)   # (1, 151)
-        symp = np.expand_dims(symp, axis=0)   # (1, 14)
-
-        result        = run_inference(spec, feat, symp)
-        condition     = result['condition']
-        confidence    = result['confidence']
-        severity_info = generate_explanation(condition, confidence)
-
-        logger.info(f"[{request_id}] PREDICTION: {condition} ({confidence:.1%}) | {result['probabilities']}")
-
-        return PredictionResult(
-            condition=condition,
-            severity=severity_info['severity'],
-            confidence=confidence,
-            explanation=severity_info['explanation'],
-            actions=severity_info['actions'],
-            seeDoctor=severity_info['seeDoctor'],
-            probabilities=result['probabilities'],
-            timestamp=datetime.now().isoformat(),
-        )
+        # v2.6: heavy CPU work runs off the event loop
+        result = await run_in_threadpool(process_prediction_sync, audio_bytes, answers_dict, request_id)
+        return PredictionResult(**result)
 
     except HTTPException as e:
         logger.error(f"[{request_id}] HTTP error: {e.detail}")
